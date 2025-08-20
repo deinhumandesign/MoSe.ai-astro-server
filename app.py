@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+import json
 import swisseph as swe
 import pytz
 from datetime import datetime
@@ -14,7 +15,7 @@ def health():
 def version():
     return jsonify({
         "service": "MoSe.ai_astro_server",
-        "marker": "v-debug-01",  # ändere diese Zeichenkette bei neuem Deploy, um frischen Code zu verifizieren
+        "marker": "v-accept-any-body-01",
         "swisseph": getattr(swe, "__version__", "unknown"),
         "status": "live"
     }), 200
@@ -35,10 +36,7 @@ PLANETS = {
     "lilith": swe.OSCU_APOG
 }
 
-# Swiss Ephemeris + Geschwindigkeiten
 EPH_FLAGS = swe.FLG_SWIEPH | swe.FLG_SPEED
-
-# erlaubte Häusersysteme (Swiss Ephemeris Codes)
 ALLOWED_HOUSES = {"P","K","E","W","R","C","B","H","M","T","O"}
 
 
@@ -86,12 +84,49 @@ def pick_housesys(val):
         raise ValueError(f"houses_system '{code}' wird nicht unterstützt")
     return code.encode("ascii")
 
+def read_input():
+    """
+    Nimmt den Request-Körper an, egal wie Make ihn sendet:
+    - korrektes JSON (mit/ohne Header)
+    - Raw-Text JSON
+    - Form-Data/URL-encoded
+    - Query-Parameter
+    Gibt immer ein dict zurück oder wirft einen klaren Fehler.
+    """
+    # 1) Versuch: JSON, egal welcher Content-Type
+    try:
+        data = request.get_json(force=True, silent=True)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    # 2) Versuch: Raw-Body als JSON parsen
+    try:
+        raw = request.get_data(as_text=True)
+        if raw:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+
+    # 3) Versuch: Form-Daten
+    if request.form:
+        return {k: request.form.get(k) for k in request.form.keys()}
+
+    # 4) Versuch: Query-String
+    if request.args:
+        return {k: request.args.get(k) for k in request.args.keys()}
+
+    raise ValueError("Request hat keinen lesbaren Body/Parameter (erwarte JSON mit timestamp_utc, latitude, longitude)")
+
 
 # -------- API --------
 @app.route("/astro", methods=["POST"])
 def astro():
     try:
-        data = request.get_json(force=True)
+        data = read_input()
         if not isinstance(data, dict):
             raise ValueError("Body muss JSON-Objekt sein")
 
@@ -111,9 +146,8 @@ def astro():
         jd = swe.julday(dt.year, dt.month, dt.day,
                         dt.hour + dt.minute/60 + dt.second/3600)
 
+        # Häuser (mit Fallback, z. B. bei sehr hohen Breiten)
         warnings = []
-
-        # Häuser mit Fallback (z. B. bei sehr hohen Breiten)
         try:
             cusps, ascmc = swe.houses_ex(jd, lat, lon, hs_code)
         except Exception:
@@ -121,7 +155,6 @@ def astro():
             warnings.append("houses_system_fallback_to_W")
             hs_code = b"W"
 
-        # Längen prüfen
         if not isinstance(cusps, (list, tuple)) or len(cusps) < 13:
             raise ValueError(f"houses_ex lieferte unerwartete cusps-Länge: {len(cusps) if isinstance(cusps,(list,tuple)) else 'kein Array'}")
         if not isinstance(ascmc, (list, tuple)) or len(ascmc) < 2:
@@ -135,26 +168,27 @@ def astro():
         planets = {}
         planet_result_lengths = {}
         for name, pid in PLANETS.items():
-            res = swe.calc_ut(jd, pid, EPH_FLAGS)
-            if not isinstance(res, (list, tuple)) or len(res) < 1:
-                planets[name] = {"error": "calc_ut Ergebnis leer/ungültig"}
-                planet_result_lengths[name] = None
+            try:
+                res = swe.calc_ut(jd, pid, EPH_FLAGS)
+                if not isinstance(res, (list, tuple)) or len(res) < 1:
+                    planets[name] = {"error": "calc_ut Ergebnis leer/ungültig"}
+                    planet_result_lengths[name] = None
+                    warnings.append(f"{name}_calc_failed")
+                    continue
+                planet_result_lengths[name] = len(res)
+                plon = normalize_deg(res[0])
+                plat = float(res[1]) if len(res) > 1 else 0.0
+                pspeed = float(res[3]) if len(res) > 3 else 0.0
+                planets[name] = {
+                    "lon": round(plon, 3),
+                    "lat": round(plat, 3),
+                    "speed": round(pspeed, 3),
+                    "sign": sign_from_lon(plon)
+                }
+            except Exception as ex:
+                planets[name] = {"error": str(ex)}
                 warnings.append(f"{name}_calc_failed")
-                continue
 
-            planet_result_lengths[name] = len(res)
-            plon = normalize_deg(res[0])
-            plat = float(res[1]) if len(res) > 1 else 0.0
-            pspeed = float(res[3]) if len(res) > 3 else 0.0
-
-            planets[name] = {
-                "lon": round(plon, 3),
-                "lat": round(plat, 3),
-                "speed": round(pspeed, 3),
-                "sign": sign_from_lon(plon)
-            }
-
-        # Response aufbauen
         debug = bool(data.get("debug"))
         out = {
             "datetime_utc": dt.replace(tzinfo=pytz.UTC).isoformat(),
