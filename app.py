@@ -1,19 +1,17 @@
 from flask import Flask, request, jsonify
-import json
+import json, os
 import swisseph as swe
 import pytz
 from pytz.exceptions import AmbiguousTimeError, NonExistentTimeError
 from datetime import datetime, timedelta
 
-# ---- Setup -------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# App + Swiss Ephemeris (absoluter Pfad)
+# ------------------------------------------------------------------------------
 app = Flask(__name__)
 
-# Ephemeriden (für Chiron & Co.)
-# Ordner liegt in deinem Repo als: ephe/seas_18.se1
-try:
-    swe.set_ephe_path("ephe")
-except Exception:
-    pass  # Fallback: Systempfade
+EPHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ephe")
+swe.set_ephe_path(EPHE_DIR)
 
 @app.route("/", methods=["GET"])
 def health():
@@ -28,7 +26,9 @@ def version():
         "status": "live"
     }), 200
 
-# ---- Basics ------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Basics
+# ------------------------------------------------------------------------------
 SIGNS = ["Aries","Taurus","Gemini","Cancer","Leo","Virgo",
          "Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces"]
 
@@ -101,7 +101,9 @@ def read_input():
         return {k: request.args.get(k) for k in request.args.keys()}
     raise ValueError("kein lesbarer Body/Parameter")
 
-# ---- Zeit-Parsing ------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Zeit-Parsing
+# ------------------------------------------------------------------------------
 def parse_ts_from_inputs(data: dict) -> (datetime, dict):
     # 1) Direkter UTC-Timestamp (ISO/Unix)
     ts = data.get("timestamp_utc")
@@ -150,16 +152,16 @@ def parse_ts_from_inputs(data: dict) -> (datetime, dict):
     offset_seconds = int(float(raw)) + int(float(dst))
     return dt_local_naive - timedelta(seconds=offset_seconds), {"mode": "local_offsets", "offset": offset_seconds}
 
-# ---- HD: Gate/Line/Color/Tone/Base ------------------------------------------
-# Gatebreite etc.
+# ------------------------------------------------------------------------------
+# HD: Gate/Line/Color/Tone/Base
+# ------------------------------------------------------------------------------
 GATE_SIZE = 360.0 / 64.0          # 5.625°
 LINE_SIZE = GATE_SIZE / 6.0       # 0.9375°
 COLOR_SIZE = LINE_SIZE / 6.0
 TONE_SIZE  = COLOR_SIZE / 6.0
 BASE_SIZE  = TONE_SIZE / 5.0
 
-# Gate-Reihenfolge entlang der Ekliptik (0° Widder → 360°), Startoffset bei Gate 25 @ 28°15' Fische
-# Quelle: Rave-Wheel Gradbereiche je Zeichen. :contentReference[oaicite:1]{index=1}
+# Gate-Reihenfolge (0° Widder → 360°), Start bei Gate 25 @ 28°15' Fische
 GATE_ORDER = [
     25,17,21,51,42,3, 27,24,2,23,8, 20,16,35,45,12,15,
     52,39,53,62,56, 31,33,7,4,29, 59,40,64,47,6,46,
@@ -173,7 +175,6 @@ START_DEG = normalize_deg(330 + 28.25)  # 28°15' Fische = 358.25°
 def hd_from_lon(lon_deg: float):
     """lon_deg (tropisch, 0..360) -> gate/line/color/tone/base (1-indexiert)"""
     x = normalize_deg(lon_deg)
-    # Delta zur Startgrenze
     delta = (x - START_DEG) % 360.0
     idx = int(delta // GATE_SIZE)  # 0..63
     inside = delta - idx * GATE_SIZE
@@ -189,7 +190,9 @@ def hd_from_lon(lon_deg: float):
         "base": base
     }
 
-# ---- Astro rechnen (Birth + Design) -----------------------------------------
+# ------------------------------------------------------------------------------
+# Astro rechnen (Birth + Design)
+# ------------------------------------------------------------------------------
 PLANETS = {
     "sun": swe.SUN, "moon": swe.MOON, "mercury": swe.MERCURY, "venus": swe.VENUS,
     "mars": swe.MARS, "jupiter": swe.JUPITER, "saturn": swe.SATURN,
@@ -205,20 +208,16 @@ FLAGS_SWIEPH = swe.FLG_SWIEPH | swe.FLG_SPEED
 
 def calc_planets(jd, lat, lon, cusps12):
     """liefert dict aller Punkte inkl. Zeichen, Haus, HD"""
-    # ASC/MC für Häuser
-    planets = {}
-    # Hauszuordnung: Cusp-Liste (12 Werte, Grad) → 1..12
     def house_of(lon_deg):
         L = normalize_deg(lon_deg)
-        # finde letztes Cusp <= L im Kreis
         for i in range(12):
             a = cusps12[i]
             b = cusps12[(i+1) % 12]
-            # Segment a..b (über 0° beachten)
             if (a <= b and a <= L < b) or (a > b and (L >= a or L < b)):
                 return i+1
         return 12
 
+    planets = {}
     for name, pid in PLANETS.items():
         try:
             flags = FLAGS_SWIEPH if name in ("chiron",) else FLAGS_MOSEPH
@@ -260,8 +259,7 @@ def calc_planets(jd, lat, lon, cusps12):
             "hd": hd_from_lon(snlon)
         }
 
-    # Nur MEAN Lilith ausgeben (kein lilith_true)
-    # -> bereits so definiert: lilith_mean
+    # Nur MEAN Lilith ausgeben
     return planets
 
 def calc_houses(jd, lat, lon, hs_code):
@@ -270,17 +268,14 @@ def calc_houses(jd, lat, lon, hs_code):
         raise ValueError("houses_ex ascmc-Länge unerwartet")
     asc = normalize_deg(ascmc[0]); mc = normalize_deg(ascmc[1])
     cusps12 = cusps_to_12(cusps)
-    # Keys c1..c12 + asc/mc + Liste
-    houses = {
-        "asc": round(asc, 3),
-        "mc": round(mc, 3),
-        "cusps": cusps12
-    }
+    houses = {"asc": round(asc, 3), "mc": round(mc, 3), "cusps": cusps12}
     for i, val in enumerate(cusps12, start=1):
         houses[f"c{i}"] = val
     return houses, cusps12
 
-# ---- API ---------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# API
+# ------------------------------------------------------------------------------
 @app.route("/astro", methods=["POST", "GET"])
 def astro():
     try:
@@ -301,8 +296,7 @@ def astro():
         houses_birth, cusps_birth = calc_houses(jd, lat, lon, hs_code)
         planets_birth = calc_planets(jd, lat, lon, cusps_birth)
 
-        # Design (≈ 88° Solarbogen zurück)
-        # Referenz: - (88 * 365.2422 / 360) Tage
+        # Design (≈ 88° Solarbogen zurück)  -> ~ (88 * 365.2422 / 360) Tage
         days_back = 88.0 * 365.2422 / 360.0
         dt_design = dt_utc - timedelta(days=days_back)
         jd_d = swe.julday(dt_design.year, dt_design.month, dt_design.day,
