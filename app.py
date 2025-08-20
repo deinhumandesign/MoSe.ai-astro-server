@@ -6,12 +6,26 @@ from pytz.exceptions import AmbiguousTimeError, NonExistentTimeError
 from datetime import datetime, timedelta
 
 # ------------------------------------------------------------------------------
-# App + Swiss Ephemeris (absoluter Pfad)
+# App + Swiss Ephemeris (absoluter Pfad) + Diagnose
 # ------------------------------------------------------------------------------
 app = Flask(__name__)
 
 EPHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ephe")
 swe.set_ephe_path(EPHE_DIR)
+
+def _ephe_info():
+    exists = os.path.isdir(EPHE_DIR)
+    files = []
+    try:
+        files = sorted(os.listdir(EPHE_DIR))[:50]
+    except Exception:
+        pass
+    return {
+        "ephe_dir": EPHE_DIR,
+        "ephe_dir_exists": exists,
+        "has_seas_18.se1": ("seas_18.se1" in files),
+        "files_sample": files
+    }
 
 @app.route("/", methods=["GET"])
 def health():
@@ -21,9 +35,10 @@ def health():
 def version():
     return jsonify({
         "service": "MoSe.ai_astro_server",
-        "marker": "v-hd-gates-lines-v1",
+        "marker": "v-ephe-dbg-01",
         "swisseph": getattr(swe, "__version__", "unknown"),
-        "status": "live"
+        "status": "live",
+        "ephe": _ephe_info()
     }), 200
 
 # ------------------------------------------------------------------------------
@@ -133,7 +148,6 @@ def parse_ts_from_inputs(data: dict) -> (datetime, dict):
     except Exception:
         raise ValueError("date_local/time_local Format erwartet: 'D.M.YYYY' und 'H:mm'")
 
-    # bevorzugt tz_name
     tz_name = data.get("tz_name")
     if tz_name:
         tz = pytz.timezone(str(tz_name).strip())
@@ -145,7 +159,6 @@ def parse_ts_from_inputs(data: dict) -> (datetime, dict):
             local_dt = tz.localize(dt_local_naive + timedelta(hours=1), is_dst=True)
         return local_dt.astimezone(pytz.UTC).replace(tzinfo=None), {"mode": "local_tzname", "tz_name": tz_name}
 
-    # Fallback: raw_offset + dst_offset (Sekunden)
     raw = data.get("raw_offset"); dst = data.get("dst_offset")
     if raw is None or dst is None:
         raise ValueError("tz_name oder (raw_offset & dst_offset) erforderlich")
@@ -169,11 +182,9 @@ GATE_ORDER = [
     58,38,54,61,60, 41,19,13,49,30, 55,37,63,22,36
 ]  # Länge = 64
 
-# Startgrenze (Grad) der GATE_ORDER[0] = Gate 25
 START_DEG = normalize_deg(330 + 28.25)  # 28°15' Fische = 358.25°
 
 def hd_from_lon(lon_deg: float):
-    """lon_deg (tropisch, 0..360) -> gate/line/color/tone/base (1-indexiert)"""
     x = normalize_deg(lon_deg)
     delta = (x - START_DEG) % 360.0
     idx = int(delta // GATE_SIZE)  # 0..63
@@ -182,13 +193,7 @@ def hd_from_lon(lon_deg: float):
     color = int((inside % LINE_SIZE) // COLOR_SIZE) + 1   # 1..6
     tone  = int((inside % COLOR_SIZE) // TONE_SIZE) + 1   # 1..6
     base  = int((inside % TONE_SIZE)  // BASE_SIZE) + 1   # 1..5
-    return {
-        "gate": GATE_ORDER[idx],
-        "line": line,
-        "color": color,
-        "tone": tone,
-        "base": base
-    }
+    return {"gate": GATE_ORDER[idx], "line": line, "color": color, "tone": tone, "base": base}
 
 # ------------------------------------------------------------------------------
 # Astro rechnen (Birth + Design)
@@ -202,17 +207,14 @@ PLANETS = {
     "chiron": swe.CHIRON
 }
 
-# Flags: Moshier (ohne Dateien) + Speed; für Chiron separat SWIEPH
 FLAGS_MOSEPH = swe.FLG_MOSEPH | swe.FLG_SPEED
 FLAGS_SWIEPH = swe.FLG_SWIEPH | swe.FLG_SPEED
 
 def calc_planets(jd, lat, lon, cusps12):
-    """liefert dict aller Punkte inkl. Zeichen, Haus, HD"""
     def house_of(lon_deg):
         L = normalize_deg(lon_deg)
         for i in range(12):
-            a = cusps12[i]
-            b = cusps12[(i+1) % 12]
+            a = cusps12[i]; b = cusps12[(i+1) % 12]
             if (a <= b and a <= L < b) or (a > b and (L >= a or L < b)):
                 return i+1
         return 12
@@ -239,27 +241,18 @@ def calc_planets(jd, lat, lon, cusps12):
     if "sun" in planets and "error" not in planets["sun"]:
         eplon = normalize_deg(planets["sun"]["lon"] + 180.0)
         planets["earth"] = {
-            "lon": round(eplon, 3),
-            "lat": 0.0,
-            "speed": 0.0,
-            "sign": sign_from_lon(eplon),
-            "house": house_of(eplon),
-            "hd": hd_from_lon(eplon)
+            "lon": round(eplon, 3), "lat": 0.0, "speed": 0.0,
+            "sign": sign_from_lon(eplon), "house": house_of(eplon), "hd": hd_from_lon(eplon)
         }
 
     # South Node = True Node + 180°
     if "true_node" in planets and "error" not in planets["true_node"]:
         snlon = normalize_deg(planets["true_node"]["lon"] + 180.0)
         planets["south_node"] = {
-            "lon": round(snlon, 3),
-            "lat": 0.0,
-            "speed": 0.0,
-            "sign": sign_from_lon(snlon),
-            "house": house_of(snlon),
-            "hd": hd_from_lon(snlon)
+            "lon": round(snlon, 3), "lat": 0.0, "speed": 0.0,
+            "sign": sign_from_lon(snlon), "house": house_of(snlon), "hd": hd_from_lon(snlon)
         }
 
-    # Nur MEAN Lilith ausgeben
     return planets
 
 def calc_houses(jd, lat, lon, hs_code):
@@ -296,7 +289,7 @@ def astro():
         houses_birth, cusps_birth = calc_houses(jd, lat, lon, hs_code)
         planets_birth = calc_planets(jd, lat, lon, cusps_birth)
 
-        # Design (≈ 88° Solarbogen zurück)  -> ~ (88 * 365.2422 / 360) Tage
+        # Design (≈ 88° Solarbogen zurück)
         days_back = 88.0 * 365.2422 / 360.0
         dt_design = dt_utc - timedelta(days=days_back)
         jd_d = swe.julday(dt_design.year, dt_design.month, dt_design.day,
