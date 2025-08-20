@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 import json
 import swisseph as swe
 import pytz
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
@@ -15,7 +15,7 @@ def health():
 def version():
     return jsonify({
         "service": "MoSe.ai_astro_server",
-        "marker": "v-planet-shape-fix-01",
+        "marker": "v-local-dt-support-01",
         "swisseph": getattr(swe, "__version__", "unknown"),
         "status": "live"
     }), 200
@@ -27,20 +27,16 @@ SIGNS = [
     "Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces"
 ]
 
-# True Node & True Lilith (osculating apogee).
-# Hinweis: CHIRON benötigt SE-Datafiles; ohne diese liefern wir eine Warnung/Fehlerobjekt.
+# True Node & True Lilith (osculating apogee). Chiron benötigt SE-Datafiles.
 PLANETS = {
     "sun": swe.SUN, "moon": swe.MOON, "mercury": swe.MERCURY, "venus": swe.VENUS,
     "mars": swe.MARS, "jupiter": swe.JUPITER, "saturn": swe.SATURN,
     "uranus": swe.URANUS, "neptune": swe.NEPTUNE, "pluto": swe.PLUTO,
-    "true_node": swe.TRUE_NODE,
-    "lilith": swe.OSCU_APOG,
-    "chiron": swe.CHIRON
+    "true_node": swe.TRUE_NODE, "lilith": swe.OSCU_APOG, "chiron": swe.CHIRON
 }
 
-# Flags: **Moshier** + SPEED → keine SE-Datafiles nötig (Planeten/Node/Lilith laufen).
+# Moshier + Speed → keine SE-Datafiles nötig (Chiron ggf. Fehler/Warnung)
 EPH_FLAGS = swe.FLG_MOSEPH | swe.FLG_SPEED
-
 ALLOWED_HOUSES = {"P","K","E","W","R","C","B","H","M","T","O"}
 
 
@@ -52,30 +48,70 @@ def normalize_deg(x: float) -> float:
 def sign_from_lon(lon: float) -> str:
     return SIGNS[int(normalize_deg(lon) // 30) % 12]
 
-def parse_ts(ts_val):
-    if ts_val is None:
-        raise ValueError("timestamp_utc fehlt")
-    if isinstance(ts_val, (int, float)):
-        return datetime.utcfromtimestamp(float(ts_val))
-    if isinstance(ts_val, str):
-        s = ts_val.strip()
-        if s.replace('.', '', 1).isdigit():
-            return datetime.utcfromtimestamp(float(s))
-        s = s.replace(" ", "T")
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            return dt
-        return dt.astimezone(pytz.UTC).replace(tzinfo=None)
-    raise ValueError("timestamp_utc hat ein nicht unterstütztes Format")
+def parse_ts_utc_or_local(data: dict) -> datetime:
+    """
+    Gibt eine **naive UTC-datetime** zurück, basierend auf:
+    - timestamp_utc  (ISO oder Unix)
+    ODER
+    - date_local (z.B. '31.1.1992'), time_local (z.B. '21:12' oder '21:12 Uhr'),
+      und entweder offset_seconds ODER (raw_offset + dst_offset)
+    """
+    # 1) Direkter UTC-Timestamp?
+    ts = data.get("timestamp_utc")
+    if ts is not None:
+        if isinstance(ts, (int, float)):
+            return datetime.utcfromtimestamp(float(ts))
+        if isinstance(ts, str):
+            s = ts.strip()
+            # Unix als String?
+            if s.replace('.', '', 1).isdigit():
+                return datetime.utcfromtimestamp(float(s))
+            # ISO normalisieren
+            s = s.replace(" ", "T")
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                return dt  # interpretieren als UTC
+            return dt.astimezone(pytz.UTC).replace(tzinfo=None)
+
+    # 2) Lokales Datum/Zeit + Offset
+    date_local = data.get("date_local") or data.get("geburtsdatum")
+    time_local = data.get("time_local") or data.get("geburtszeit")
+    if not date_local or not time_local:
+        raise ValueError("timestamp_utc oder (date_local & time_local) erforderlich")
+
+    # '21:12 Uhr' -> '21:12'
+    time_local = str(time_local).replace(" Uhr", "").strip()
+
+    # '31.1.1992 21:12' im Format D.M.YYYY H:mm
+    try:
+        dt_local = datetime.strptime(f"{date_local.strip()} {time_local}", "%d.%m.%Y %H:%M")
+    except Exception:
+        raise ValueError("date_local/time_local Format erwartet: 'D.M.YYYY' und 'H:mm'")
+
+    # Offset bestimmen
+    offset_seconds = data.get("offset_seconds")
+    if offset_seconds is None:
+        raw = data.get("raw_offset")
+        dst = data.get("dst_offset")
+        if raw is None or dst is None:
+            raise ValueError("offset_seconds oder (raw_offset & dst_offset) erforderlich")
+        try:
+            offset_seconds = int(float(raw)) + int(float(dst))
+        except Exception:
+            raise ValueError("raw_offset/dst_offset müssen Zahlen (Sekunden) sein")
+
+    # Lokale Zeit -> UTC
+    dt_utc = dt_local - timedelta(seconds=int(offset_seconds))
+    return dt_utc
 
 def validate_lat_lon(lat, lon):
     lat = float(lat); lon = float(lon)
     if not (-90.0 <= lat <= 90.0):
-        raise ValueError("latitude außerhalb des gültigen Bereichs (-90..90)")
+        raise ValueError("latitude außerhalb (-90..90)")
     if not (-180.0 <= lon <= 180.0):
-        raise ValueError("longitude außerhalb des gültigen Bereichs (-180..180)")
+        raise ValueError("longitude außerhalb (-180..180)")
     return lat, lon
 
 def pick_housesys(val):
@@ -86,15 +122,42 @@ def pick_housesys(val):
         raise ValueError(f"houses_system '{code}' wird nicht unterstützt")
     return code.encode("ascii")
 
+def cusps_to_12(cusps):
+    if not isinstance(cusps, (list, tuple)):
+        raise ValueError("houses_ex lieferte keine Cusp-Liste")
+    n = len(cusps)
+    if n >= 13:
+        return [round(float(cusps[i]), 3) for i in range(1, 13)]
+    if n == 12:
+        return [round(float(cusps[i]), 3) for i in range(0, 12)]
+    raise ValueError(f"houses_ex cusps-Länge unerwartet: {n}")
+
+def extract_lon_lat_speed(res):
+    # a) [lon, lat, dist, speed_lon, ...]
+    # b) ([lon, lat, dist], [speed_lon, speed_lat, speed_dist])
+    if not isinstance(res, (list, tuple)) or len(res) == 0:
+        raise ValueError("calc_ut Ergebnis leer/ungültig")
+    first = res[0]
+    if isinstance(first, (list, tuple)):  # tuple_of_tuples
+        lon = float(first[0])
+        lat = float(first[1]) if len(first) > 1 else 0.0
+        spd = float(res[1][0]) if len(res) > 1 and isinstance(res[1], (list, tuple)) and len(res[1]) > 0 else 0.0
+    else:  # flat
+        lon = float(res[0])
+        lat = float(res[1]) if len(res) > 1 else 0.0
+        spd = float(res[3]) if len(res) > 3 else 0.0
+    return lon, lat, spd
+
+
 def read_input():
-    # JSON (auch ohne Header)
+    # JSON
     try:
         data = request.get_json(force=True, silent=True)
         if isinstance(data, dict):
             return data
     except Exception:
         pass
-    # Raw-Body als JSON
+    # Raw-JSON
     try:
         raw = request.get_data(as_text=True)
         if raw:
@@ -109,39 +172,7 @@ def read_input():
     # Query
     if request.args:
         return {k: request.args.get(k) for k in request.args.keys()}
-    raise ValueError("Request hat keinen lesbaren Body/Parameter (erwarte JSON mit timestamp_utc, latitude, longitude)")
-
-def cusps_to_12(cusps):
-    # Akzeptiere beide Varianten (12 oder 13 Elemente)
-    if not isinstance(cusps, (list, tuple)):
-        raise ValueError("houses_ex lieferte keine Cusp-Liste")
-    n = len(cusps)
-    if n >= 13:
-        return [round(float(cusps[i]), 3) for i in range(1, 13)]
-    if n == 12:
-        return [round(float(cusps[i]), 3) for i in range(0, 12)]
-    raise ValueError(f"houses_ex lieferte unerwartete cusps-Länge: {n}")
-
-def extract_lon_lat_speed(res):
-    """
-    Macht beide Formen robust:
-    a) [lon, lat, dist, speed_lon, ...]
-    b) ([lon, lat, dist], [speed_lon, speed_lat, speed_dist])
-    """
-    if not isinstance(res, (list, tuple)) or len(res) == 0:
-        raise ValueError("calc_ut Ergebnis leer/ungültig")
-    first = res[0]
-    # b) zwei-Tupel-Form
-    if isinstance(first, (list, tuple)):
-        lon = float(first[0])
-        lat = float(first[1]) if len(first) > 1 else 0.0
-        spd = float(res[1][0]) if len(res) > 1 and isinstance(res[1], (list, tuple)) and len(res[1]) > 0 else 0.0
-        return lon, lat, spd
-    # a) flache Form
-    lon = float(res[0])
-    lat = float(res[1]) if len(res) > 1 else 0.0
-    spd = float(res[3]) if len(res) > 3 else 0.0
-    return lon, lat, spd
+    raise ValueError("kein lesbarer Body/Parameter")
 
 
 # -------- API --------
@@ -152,24 +183,21 @@ def astro():
         if not isinstance(data, dict):
             raise ValueError("Body muss JSON-Objekt sein")
 
-        ts = data.get("timestamp_utc")
         lat = data.get("latitude")
         lon = data.get("longitude")
-        hs_in = data.get("houses_system")
-
         if lat is None or lon is None:
             raise ValueError("latitude und longitude sind erforderlich")
-
         lat, lon = validate_lat_lon(lat, lon)
-        hs_code = pick_housesys(hs_in)
 
-        dt = parse_ts(ts)
-        jd = swe.julday(dt.year, dt.month, dt.day,
-                        dt.hour + dt.minute/60 + dt.second/3600)
+        hs_code = pick_housesys(data.get("houses_system"))
 
-        warnings = []
+        # Zeitpunkt (UTC) bestimmen – entweder timestamp_utc ODER date/time + offsets
+        dt_utc = parse_ts_utc_or_local(data)
+        jd = swe.julday(dt_utc.year, dt_utc.month, dt_utc.day,
+                        dt_utc.hour + dt_utc.minute/60 + dt_utc.second/3600)
 
         # Häuser (mit Fallback auf Whole Sign)
+        warnings = []
         try:
             cusps, ascmc = swe.houses_ex(jd, lat, lon, hs_code)
         except Exception:
@@ -177,7 +205,6 @@ def astro():
             warnings.append("houses_system_fallback_to_W")
             hs_code = b"W"
 
-        # ascmc hat mind. 2 Werte (ASC, MC); viele Varianten liefern 8.
         if not isinstance(ascmc, (list, tuple)) or len(ascmc) < 2:
             raise ValueError(f"houses_ex ascmc-Länge unerwartet: {len(ascmc) if isinstance(ascmc,(list,tuple)) else 'kein Array'}")
 
@@ -187,19 +214,9 @@ def astro():
 
         # Planeten
         planets = {}
-        planet_result_shapes = {}
         for name, pid in PLANETS.items():
             try:
                 res = swe.calc_ut(jd, pid, EPH_FLAGS)
-                # shape protokollieren
-                if isinstance(res, (list, tuple)):
-                    if len(res) >= 1 and isinstance(res[0], (list, tuple)):
-                        planet_result_shapes[name] = "tuple_of_tuples"
-                    else:
-                        planet_result_shapes[name] = f"flat_len_{len(res)}"
-                else:
-                    planet_result_shapes[name] = "unknown"
-
                 lon_v, lat_v, spd_v = extract_lon_lat_speed(res)
                 plon = normalize_deg(lon_v)
                 planets[name] = {
@@ -214,7 +231,7 @@ def astro():
 
         debug = str(data.get("debug")).lower() == "true" if isinstance(data.get("debug"), str) else bool(data.get("debug"))
         out = {
-            "datetime_utc": dt.replace(tzinfo=pytz.UTC).isoformat(),
+            "datetime_utc": dt_utc.replace(tzinfo=pytz.UTC).isoformat(),
             "settings": {"houses_system": hs_code.decode("ascii"), "flags": int(EPH_FLAGS)},
             "planets": planets,
             "houses": {"asc": round(asc, 3), "mc": round(mc, 3), "cusps": cusps12}
@@ -225,8 +242,7 @@ def astro():
             out["__debug"] = {
                 "jd": jd,
                 "ascmc_len": len(ascmc),
-                "cusps_len": len(cusps),
-                "planet_result_shapes": planet_result_shapes
+                "cusps_len": len(cusps)
             }
 
         return jsonify(out), 200
