@@ -4,6 +4,10 @@ import pytz
 from datetime import datetime
 
 app = Flask(__name__)
+@app.route("/")
+def health():
+    return "OK", 200
+
 
 PLANETS = {
     "sun": swe.SUN, "moon": swe.MOON, "mercury": swe.MERCURY, "venus": swe.VENUS,
@@ -60,3 +64,4 @@ def astro():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
