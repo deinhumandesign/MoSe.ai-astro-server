@@ -15,7 +15,7 @@ def health():
 def version():
     return jsonify({
         "service": "MoSe.ai_astro_server",
-        "marker": "v-accept-any-body-01",
+        "marker": "v-accept-any-body-02",  # Marker um frische Deploys zu erkennen
         "swisseph": getattr(swe, "__version__", "unknown"),
         "status": "live"
     }), 200
@@ -86,14 +86,14 @@ def pick_housesys(val):
 
 def read_input():
     """
-    Nimmt den Request-Körper an, egal wie Make ihn sendet:
-    - korrektes JSON (mit/ohne Header)
+    Nimmt den Request an – egal wie er kommt:
+    - korrektes JSON (mit/ohne Content-Type)
     - Raw-Text JSON
     - Form-Data/URL-encoded
-    - Query-Parameter
+    - Query-Parameter (GET oder POST)
     Gibt immer ein dict zurück oder wirft einen klaren Fehler.
     """
-    # 1) Versuch: JSON, egal welcher Content-Type
+    # 1) JSON (auch wenn Header fehlt/falsch ist)
     try:
         data = request.get_json(force=True, silent=True)
         if isinstance(data, dict):
@@ -101,7 +101,7 @@ def read_input():
     except Exception:
         pass
 
-    # 2) Versuch: Raw-Body als JSON parsen
+    # 2) Raw-Body als JSON
     try:
         raw = request.get_data(as_text=True)
         if raw:
@@ -111,11 +111,11 @@ def read_input():
     except Exception:
         pass
 
-    # 3) Versuch: Form-Daten
+    # 3) Form-Daten
     if request.form:
         return {k: request.form.get(k) for k in request.form.keys()}
 
-    # 4) Versuch: Query-String
+    # 4) Query-String
     if request.args:
         return {k: request.args.get(k) for k in request.args.keys()}
 
@@ -123,7 +123,8 @@ def read_input():
 
 
 # -------- API --------
-@app.route("/astro", methods=["POST"])
+# WICHTIG: Akzeptiere POST **und GET**, damit du im Browser testen kannst.
+@app.route("/astro", methods=["POST", "GET"])
 def astro():
     try:
         data = read_input()
@@ -189,7 +190,7 @@ def astro():
                 planets[name] = {"error": str(ex)}
                 warnings.append(f"{name}_calc_failed")
 
-        debug = bool(data.get("debug"))
+        debug = str(data.get("debug")).lower() == "true" if isinstance(data.get("debug"), str) else bool(data.get("debug"))
         out = {
             "datetime_utc": dt.replace(tzinfo=pytz.UTC).isoformat(),
             "settings": {"houses_system": hs_code.decode("ascii"), "flags": int(EPH_FLAGS)},
