@@ -1,21 +1,19 @@
 from flask import Flask, request, jsonify
-import json, os
+import json
 import swisseph as swe
 import pytz
 from pytz.exceptions import AmbiguousTimeError, NonExistentTimeError
 from datetime import datetime, timedelta
 
+# ---- Setup -------------------------------------------------------------------
 app = Flask(__name__)
 
-# ---- Swiss Ephemeris: Suchpfade (./ephe + Projektroot + Systempfade) ----
-ROOT_DIR = os.path.dirname(__file__)
-CANDIDATE_DIRS = [
-    os.path.join(ROOT_DIR, "ephe"),
-    ROOT_DIR,
-    "/usr/share/swisseph",
-    "/usr/local/share/swisseph",
-]
-swe.set_ephe_path(":".join([p for p in CANDIDATE_DIRS if os.path.isdir(p)]))
+# Ephemeriden (für Chiron & Co.)
+# Ordner liegt in deinem Repo als: ephe/seas_18.se1
+try:
+    swe.set_ephe_path("ephe")
+except Exception:
+    pass  # Fallback: Systempfade
 
 @app.route("/", methods=["GET"])
 def health():
@@ -25,26 +23,15 @@ def health():
 def version():
     return jsonify({
         "service": "MoSe.ai_astro_server",
-        "marker": "v-design-sun-earth-01",
+        "marker": "v-hd-gates-lines-v1",
         "swisseph": getattr(swe, "__version__", "unknown"),
         "status": "live"
     }), 200
 
+# ---- Basics ------------------------------------------------------------------
 SIGNS = ["Aries","Taurus","Gemini","Cancer","Leo","Virgo",
          "Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces"]
 
-PLANETS = {
-    "sun": swe.SUN, "moon": swe.MOON, "mercury": swe.MERCURY, "venus": swe.VENUS,
-    "mars": swe.MARS, "jupiter": swe.JUPITER, "saturn": swe.SATURN,
-    "uranus": swe.URANUS, "neptune": swe.NEPTUNE, "pluto": swe.PLUTO,
-    "true_node": swe.TRUE_NODE,
-    "lilith_true": swe.OSCU_APOG,   # True/Osculating Lilith
-    "lilith_mean": swe.MEAN_APOG,   # Mean Lilith (astro.com Standard)
-    "chiron": swe.CHIRON            # benötigt seas_18.se1 (liegt bei dir)
-}
-
-EPH_FLAGS_MOSEPH = swe.FLG_MOSEPH | swe.FLG_SPEED   # ohne SE-Files
-EPH_FLAGS_SWIEPH = swe.FLG_SWIEPH | swe.FLG_SPEED   # mit SE-Files (für Chiron)
 ALLOWED_HOUSES = {"P","K","E","W","R","C","B","H","M","T","O"}
 
 def normalize_deg(x: float) -> float:
@@ -53,50 +40,6 @@ def normalize_deg(x: float) -> float:
 
 def sign_from_lon(lon: float) -> str:
     return SIGNS[int(normalize_deg(lon) // 30) % 12]
-
-def parse_ts_from_inputs(data: dict):
-    # 1) Direkter UTC-Timestamp (ISO/Unix)
-    ts = data.get("timestamp_utc")
-    if ts is not None:
-        if isinstance(ts, (int, float)):
-            return datetime.utcfromtimestamp(float(ts)), {"mode": "utc_unix"}
-        if isinstance(ts, str):
-            s = ts.strip().replace(" ", "T")
-            if s.replace('.', '', 1).isdigit():
-                return datetime.utcfromtimestamp(float(s)), {"mode": "utc_unix_str"}
-            if s.endswith("Z"): s = s[:-1] + "+00:00"
-            dt = datetime.fromisoformat(s)
-            if dt.tzinfo is None: return dt, {"mode": "utc_iso_naive"}
-            return dt.astimezone(pytz.UTC).replace(tzinfo=None), {"mode": "utc_iso_tz"}
-
-    # 2) Lokales Datum/Zeit + Zeitzone
-    date_local = data.get("date_local") or data.get("geburtsdatum")
-    time_local = data.get("time_local") or data.get("geburtszeit")
-    if not date_local or not time_local:
-        raise ValueError("timestamp_utc oder (date_local & time_local) erforderlich")
-
-    time_local = str(time_local).replace(" Uhr", "").strip()
-    try:
-        dt_local_naive = datetime.strptime(f"{date_local.strip()} {time_local}", "%d.%m.%Y %H:%M")
-    except Exception:
-        raise ValueError("date_local/time_local Format erwartet: 'D.M.YYYY' und 'H:mm'")
-
-    tz_name = data.get("tz_name")
-    if tz_name:
-        tz = pytz.timezone(str(tz_name).strip())
-        try:
-            local_dt = tz.localize(dt_local_naive, is_dst=None)
-        except AmbiguousTimeError:
-            local_dt = tz.localize(dt_local_naive, is_dst=True)
-        except NonExistentTimeError:
-            local_dt = tz.localize(dt_local_naive + timedelta(hours=1), is_dst=True)
-        return local_dt.astimezone(pytz.UTC).replace(tzinfo=None), {"mode": "local_tzname", "tz_name": tz_name}
-
-    raw = data.get("raw_offset"); dst = data.get("dst_offset")
-    if raw is None or dst is None:
-        raise ValueError("tz_name oder (raw_offset & dst_offset) erforderlich")
-    offset_seconds = int(float(raw)) + int(float(dst))
-    return dt_local_naive - timedelta(seconds=offset_seconds), {"mode": "local_offsets", "offset": offset_seconds}
 
 def validate_lat_lon(lat, lon):
     lat = float(lat); lon = float(lon)
@@ -119,11 +62,15 @@ def cusps_to_12(cusps):
     raise ValueError(f"houses_ex cusps-Länge unerwartet: {n}")
 
 def extract_lon_lat_speed(res):
-    # ([lon,lat,dist],[spd_lon,...]) oder [lon,lat,dist,spd_lon,...]
+    """
+    SwissEph calc_ut kann zwei Formen liefern:
+    ([lon,lat,dist],[spd_lon,spd_lat,spd_dist])  ODER
+    [lon,lat,dist,spd_lon,...]
+    """
     if not isinstance(res, (list, tuple)) or len(res) == 0:
         raise ValueError("calc_ut Ergebnis leer/ungültig")
     first = res[0]
-    if isinstance(first, (list, tuple)):
+    if isinstance(first, (list, tuple)):  # tuple of tuples
         lon = float(first[0]); lat = float(first[1]) if len(first) > 1 else 0.0
         spd = float(res[1][0]) if len(res) > 1 and isinstance(res[1], (list, tuple)) and len(res[1]) > 0 else 0.0
     else:
@@ -132,159 +79,208 @@ def extract_lon_lat_speed(res):
     return lon, lat, spd
 
 def read_input():
+    # JSON Body
     try:
         data = request.get_json(force=True, silent=True)
         if isinstance(data, dict): return data
-    except Exception: pass
+    except Exception:
+        pass
+    # Raw JSON
     try:
         raw = request.get_data(as_text=True)
         if raw:
             data = json.loads(raw)
             if isinstance(data, dict): return data
-    except Exception: pass
-    if request.form: return {k: request.form.get(k) for k in request.form.keys()}
-    if request.args: return {k: request.args.get(k) for k in request.args.keys()}
+    except Exception:
+        pass
+    # Form
+    if request.form:
+        return {k: request.form.get(k) for k in request.form.keys()}
+    # Query
+    if request.args:
+        return {k: request.args.get(k) for k in request.args.keys()}
     raise ValueError("kein lesbarer Body/Parameter")
 
-# ---------- Hauszuordnung ----------
-def house_of(longitude: float, cusps12):
-    """Gibt Hausnummer (1..12) für ekliptikale Länge zurück."""
-    c = [float(x) for x in cusps12]
-    c13 = c[0] + 360.0
-    edges = c + [c13]
-    L = normalize_deg(float(longitude))
-    for i in range(12):
-        start = edges[i]
-        end = edges[i+1]
-        P = L if L >= start else L + 360.0
-        if start <= P < end:
-            return i + 1
-    return 12
+# ---- Zeit-Parsing ------------------------------------------------------------
+def parse_ts_from_inputs(data: dict) -> (datetime, dict):
+    # 1) Direkter UTC-Timestamp (ISO/Unix)
+    ts = data.get("timestamp_utc")
+    if ts is not None:
+        if isinstance(ts, (int, float)):
+            return datetime.utcfromtimestamp(float(ts)), {"mode": "utc_unix"}
+        if isinstance(ts, str):
+            s = ts.strip().replace(" ", "T")
+            if s.replace('.', '', 1).isdigit():
+                return datetime.utcfromtimestamp(float(s)), {"mode": "utc_unix_str"}
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                return dt, {"mode": "utc_iso_naive"}
+            return dt.astimezone(pytz.UTC).replace(tzinfo=None), {"mode": "utc_iso_tz"}
 
-# ---------- Sun/Earth/Design-Helfer ----------
-def sun_lon_at_dt(dt: datetime) -> float:
-    jd = swe.julday(dt.year, dt.month, dt.day, dt.hour + dt.minute/60 + dt.second/3600)
-    res = swe.calc_ut(jd, swe.SUN, EPH_FLAGS_MOSEPH)
-    lon, _, _ = extract_lon_lat_speed(res)
-    return normalize_deg(lon)
+    # 2) Lokales Datum/Zeit + Zeitzone
+    date_local = data.get("date_local") or data.get("geburtsdatum")
+    time_local = data.get("time_local") or data.get("geburtszeit")
+    if not date_local or not time_local:
+        raise ValueError("timestamp_utc oder (date_local & time_local) erforderlich")
 
-def unwrap_near(angle: float, ref: float) -> float:
-    """Winkellage von 'angle' in die Nähe von 'ref' bringen (Diff in [-180,180])."""
-    a = float(angle)
-    while a - ref > 180.0:
-        a -= 360.0
-    while ref - a > 180.0:
-        a += 360.0
-    return a
-
-def find_design_dt(dt_birth_utc: datetime, offset_deg: float = 88.0) -> datetime:
-    """Finde Zeitpunkt vor der Geburt, an dem Sun_long = Sun_birth - offset_deg (geozentrisch)."""
-    sun_birth = sun_lon_at_dt(dt_birth_utc)
-    target = normalize_deg(sun_birth - offset_deg)
-
-    def diff(dt):
-        L = sun_lon_at_dt(dt)
-        Lu = unwrap_near(L, target)
-        return Lu - target  # 0 am Ziel
-
-    # Bracketing: [t_low, t_high] mit diff(t_low) < 0 < diff(t_high)
-    t_high = dt_birth_utc
-    d_high = diff(t_high)
-    t_low = dt_birth_utc - timedelta(days=120)
-    d_low = diff(t_low)
-    it = 0
-    while d_low >= 0 and it < 10:
-        t_low -= timedelta(days=120)
-        d_low = diff(t_low)
-        it += 1
-
-    if d_low * d_high > 0:
-        # Fallback (sollte praktisch nicht passieren)
-        return dt_birth_utc - timedelta(days=88)
-
-    # Bisection bis ~1 Sekunde
-    for _ in range(60):
-        t_mid = t_low + (t_high - t_low) / 2
-        d_mid = diff(t_mid)
-        if abs(d_mid) < 1e-6 or (t_high - t_low).total_seconds() <= 1:
-            t_high = t_mid
-            break
-        if d_low * d_mid <= 0:
-            t_high, d_high = t_mid, d_mid
-        else:
-            t_low, d_low = t_mid, d_mid
-    return t_high
-
-# ---------- Chart-Berechnung (Planeten + Häuser + Zusatzpunkte) ----------
-def compute_chart(dt_utc: datetime, lat: float, lon: float, hs_code: bytes):
-    jd = swe.julday(dt_utc.year, dt_utc.month, dt_utc.day,
-                    dt_utc.hour + dt_utc.minute/60 + dt_utc.second/3600)
-
-    warnings = []
+    time_local = str(time_local).replace(" Uhr", "").strip()
     try:
-        cusps, ascmc = swe.houses_ex(jd, lat, lon, hs_code)
+        dt_local_naive = datetime.strptime(f"{date_local.strip()} {time_local}", "%d.%m.%Y %H:%M")
     except Exception:
-        cusps, ascmc = swe.houses_ex(jd, lat, lon, b"W")
-        warnings.append("houses_system_fallback_to_W"); hs_code = b"W"
+        raise ValueError("date_local/time_local Format erwartet: 'D.M.YYYY' und 'H:mm'")
 
-    if not isinstance(ascmc, (list, tuple)) or len(ascmc) < 2:
-        raise ValueError("houses_ex ascmc-Länge unerwartet")
+    # bevorzugt tz_name
+    tz_name = data.get("tz_name")
+    if tz_name:
+        tz = pytz.timezone(str(tz_name).strip())
+        try:
+            local_dt = tz.localize(dt_local_naive, is_dst=None)
+        except AmbiguousTimeError:
+            local_dt = tz.localize(dt_local_naive, is_dst=True)
+        except NonExistentTimeError:
+            local_dt = tz.localize(dt_local_naive + timedelta(hours=1), is_dst=True)
+        return local_dt.astimezone(pytz.UTC).replace(tzinfo=None), {"mode": "local_tzname", "tz_name": tz_name}
 
-    asc = normalize_deg(ascmc[0]); mc = normalize_deg(ascmc[1])
-    cusps12 = cusps_to_12(cusps)
+    # Fallback: raw_offset + dst_offset (Sekunden)
+    raw = data.get("raw_offset"); dst = data.get("dst_offset")
+    if raw is None or dst is None:
+        raise ValueError("tz_name oder (raw_offset & dst_offset) erforderlich")
+    offset_seconds = int(float(raw)) + int(float(dst))
+    return dt_local_naive - timedelta(seconds=offset_seconds), {"mode": "local_offsets", "offset": offset_seconds}
 
+# ---- HD: Gate/Line/Color/Tone/Base ------------------------------------------
+# Gatebreite etc.
+GATE_SIZE = 360.0 / 64.0          # 5.625°
+LINE_SIZE = GATE_SIZE / 6.0       # 0.9375°
+COLOR_SIZE = LINE_SIZE / 6.0
+TONE_SIZE  = COLOR_SIZE / 6.0
+BASE_SIZE  = TONE_SIZE / 5.0
+
+# Gate-Reihenfolge entlang der Ekliptik (0° Widder → 360°), Startoffset bei Gate 25 @ 28°15' Fische
+# Quelle: Rave-Wheel Gradbereiche je Zeichen. :contentReference[oaicite:1]{index=1}
+GATE_ORDER = [
+    25,17,21,51,42,3, 27,24,2,23,8, 20,16,35,45,12,15,
+    52,39,53,62,56, 31,33,7,4,29, 59,40,64,47,6,46,
+    18,48,57,32,50, 28,44,1,43,14, 34,9,5,26,11,10,
+    58,38,54,61,60, 41,19,13,49,30, 55,37,63,22,36
+]  # Länge = 64
+
+# Startgrenze (Grad) der GATE_ORDER[0] = Gate 25
+START_DEG = normalize_deg(330 + 28.25)  # 28°15' Fische = 358.25°
+
+def hd_from_lon(lon_deg: float):
+    """lon_deg (tropisch, 0..360) -> gate/line/color/tone/base (1-indexiert)"""
+    x = normalize_deg(lon_deg)
+    # Delta zur Startgrenze
+    delta = (x - START_DEG) % 360.0
+    idx = int(delta // GATE_SIZE)  # 0..63
+    inside = delta - idx * GATE_SIZE
+    line = int(inside // LINE_SIZE) + 1           # 1..6
+    color = int((inside % LINE_SIZE) // COLOR_SIZE) + 1   # 1..6
+    tone  = int((inside % COLOR_SIZE) // TONE_SIZE) + 1   # 1..6
+    base  = int((inside % TONE_SIZE)  // BASE_SIZE) + 1   # 1..5
+    return {
+        "gate": GATE_ORDER[idx],
+        "line": line,
+        "color": color,
+        "tone": tone,
+        "base": base
+    }
+
+# ---- Astro rechnen (Birth + Design) -----------------------------------------
+PLANETS = {
+    "sun": swe.SUN, "moon": swe.MOON, "mercury": swe.MERCURY, "venus": swe.VENUS,
+    "mars": swe.MARS, "jupiter": swe.JUPITER, "saturn": swe.SATURN,
+    "uranus": swe.URANUS, "neptune": swe.NEPTUNE, "pluto": swe.PLUTO,
+    "true_node": swe.TRUE_NODE,
+    "lilith_mean": swe.MEAN_APOG,     # MEAN Lilith (wie astro.com)
+    "chiron": swe.CHIRON
+}
+
+# Flags: Moshier (ohne Dateien) + Speed; für Chiron separat SWIEPH
+FLAGS_MOSEPH = swe.FLG_MOSEPH | swe.FLG_SPEED
+FLAGS_SWIEPH = swe.FLG_SWIEPH | swe.FLG_SPEED
+
+def calc_planets(jd, lat, lon, cusps12):
+    """liefert dict aller Punkte inkl. Zeichen, Haus, HD"""
+    # ASC/MC für Häuser
     planets = {}
+    # Hauszuordnung: Cusp-Liste (12 Werte, Grad) → 1..12
+    def house_of(lon_deg):
+        L = normalize_deg(lon_deg)
+        # finde letztes Cusp <= L im Kreis
+        for i in range(12):
+            a = cusps12[i]
+            b = cusps12[(i+1) % 12]
+            # Segment a..b (über 0° beachten)
+            if (a <= b and a <= L < b) or (a > b and (L >= a or L < b)):
+                return i+1
+        return 12
+
     for name, pid in PLANETS.items():
         try:
-            flags = EPH_FLAGS_SWIEPH if name == "chiron" else EPH_FLAGS_MOSEPH
+            flags = FLAGS_SWIEPH if name in ("chiron",) else FLAGS_MOSEPH
             res = swe.calc_ut(jd, pid, flags)
             lon_v, lat_v, spd_v = extract_lon_lat_speed(res)
             plon = normalize_deg(lon_v)
-            p = {
+            planets[name] = {
                 "lon": round(plon, 3),
                 "lat": round(float(lat_v), 3),
                 "speed": round(float(spd_v), 3),
                 "sign": sign_from_lon(plon),
-                "house": house_of(plon, cusps12)
+                "house": house_of(plon),
+                "hd": hd_from_lon(plon)
             }
-            planets[name] = p
         except Exception as ex:
-            planets[name] = {"error": str(ex)}; warnings.append(f"{name}_calc_failed")
-
-    # South Node aus True Node
-    if "true_node" in planets and "lon" in planets["true_node"]:
-        sn_lon = normalize_deg(planets["true_node"]["lon"] + 180.0)
-        planets["south_node"] = {
-            "lon": round(sn_lon, 3),
-            "lat": planets["true_node"].get("lat", 0.0),
-            "speed": planets["true_node"].get("speed", 0.0),
-            "sign": sign_from_lon(sn_lon),
-            "house": house_of(sn_lon, cusps12)
-        }
+            planets[name] = {"error": str(ex)}
 
     # Earth = Sun + 180°
-    if "sun" in planets and "lon" in planets["sun"]:
-        e_lon = normalize_deg(planets["sun"]["lon"] + 180.0)
+    if "sun" in planets and "error" not in planets["sun"]:
+        eplon = normalize_deg(planets["sun"]["lon"] + 180.0)
         planets["earth"] = {
-            "lon": round(e_lon, 3),
+            "lon": round(eplon, 3),
             "lat": 0.0,
-            "speed": planets["sun"].get("speed", 0.0),
-            "sign": sign_from_lon(e_lon),
-            "house": house_of(e_lon, cusps12)
+            "speed": 0.0,
+            "sign": sign_from_lon(eplon),
+            "house": house_of(eplon),
+            "hd": hd_from_lon(eplon)
         }
 
-    houses_out = {
+    # South Node = True Node + 180°
+    if "true_node" in planets and "error" not in planets["true_node"]:
+        snlon = normalize_deg(planets["true_node"]["lon"] + 180.0)
+        planets["south_node"] = {
+            "lon": round(snlon, 3),
+            "lat": 0.0,
+            "speed": 0.0,
+            "sign": sign_from_lon(snlon),
+            "house": house_of(snlon),
+            "hd": hd_from_lon(snlon)
+        }
+
+    # Nur MEAN Lilith ausgeben (kein lilith_true)
+    # -> bereits so definiert: lilith_mean
+    return planets
+
+def calc_houses(jd, lat, lon, hs_code):
+    cusps, ascmc = swe.houses_ex(jd, lat, lon, hs_code)
+    if not isinstance(ascmc, (list, tuple)) or len(ascmc) < 2:
+        raise ValueError("houses_ex ascmc-Länge unerwartet")
+    asc = normalize_deg(ascmc[0]); mc = normalize_deg(ascmc[1])
+    cusps12 = cusps_to_12(cusps)
+    # Keys c1..c12 + asc/mc + Liste
+    houses = {
         "asc": round(asc, 3),
         "mc": round(mc, 3),
-        "cusps": cusps12,
-        # feste Keys
-        "c1": cusps12[0], "c2": cusps12[1], "c3": cusps12[2], "c4": cusps12[3],
-        "c5": cusps12[4], "c6": cusps12[5], "c7": cusps12[6], "c8": cusps12[7],
-        "c9": cusps12[8], "c10": cusps12[9], "c11": cusps12[10], "c12": cusps12[11],
+        "cusps": cusps12
     }
+    for i, val in enumerate(cusps12, start=1):
+        houses[f"c{i}"] = val
+    return houses, cusps12
 
-    return planets, houses_out, warnings, hs_code
-
+# ---- API ---------------------------------------------------------------------
 @app.route("/astro", methods=["POST", "GET"])
 def astro():
     try:
@@ -297,14 +293,22 @@ def astro():
 
         hs_code = pick_housesys(data.get("houses_system"))
 
+        # Birth (bewusst)
         dt_utc, modeinfo = parse_ts_from_inputs(data)
+        jd = swe.julday(dt_utc.year, dt_utc.month, dt_utc.day,
+                        dt_utc.hour + dt_utc.minute/60 + dt_utc.second/3600)
 
-        # Geburts-Chart
-        planets_birth, houses_birth, warnings_birth, hs_used = compute_chart(dt_utc, lat, lon, hs_code)
+        houses_birth, cusps_birth = calc_houses(jd, lat, lon, hs_code)
+        planets_birth = calc_planets(jd, lat, lon, cusps_birth)
 
-        # Design-Zeit (Sun lon = Sun_birth - 88°) & Design-Chart
-        dt_design = find_design_dt(dt_utc, offset_deg=88.0)
-        planets_design, houses_design, warnings_design, _ = compute_chart(dt_design, lat, lon, hs_used)
+        # Design (≈ 88° Solarbogen zurück)
+        # Referenz: - (88 * 365.2422 / 360) Tage
+        days_back = 88.0 * 365.2422 / 360.0
+        dt_design = dt_utc - timedelta(days=days_back)
+        jd_d = swe.julday(dt_design.year, dt_design.month, dt_design.day,
+                          dt_design.hour + dt_design.minute/60 + dt_design.second/3600)
+        houses_design, cusps_design = calc_houses(jd_d, lat, lon, hs_code)
+        planets_design = calc_planets(jd_d, lat, lon, cusps_design)
 
         out = {
             "datetime_utc": dt_utc.replace(tzinfo=pytz.UTC).isoformat(),
@@ -317,24 +321,23 @@ def astro():
                 "dst_offset": data.get("dst_offset")
             },
             "settings": {
-                "houses_system": hs_used.decode("ascii"),
-                "flags_moseph": int(EPH_FLAGS_MOSEPH),
-                "flags_swieph": int(EPH_FLAGS_SWIEPH)
+                "houses_system": hs_code.decode("ascii"),
+                "flags_moseph": int(FLAGS_MOSEPH),
+                "flags_swieph": int(FLAGS_SWIEPH)
             },
-            "planets": planets_birth,
             "houses": houses_birth,
+            "planets": planets_birth,
             "design": {
                 "datetime_utc": dt_design.replace(tzinfo=pytz.UTC).isoformat(),
-                "planets": planets_design,
-                "houses": houses_design
+                "houses": houses_design,
+                "planets": planets_design
             }
         }
-        warnings = warnings_birth + warnings_design
-        if warnings: out["warnings"] = warnings
         return jsonify(out), 200
+
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
+# ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    # lokal ok – auf Render startet gunicorn via $PORT
     app.run(host="0.0.0.0", port=8080)
