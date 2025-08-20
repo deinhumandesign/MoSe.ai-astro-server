@@ -15,7 +15,7 @@ PLANETS = {
     "mars": swe.MARS, "jupiter": swe.JUPITER, "saturn": swe.SATURN,
     "uranus": swe.URANUS, "neptune": swe.NEPTUNE, "pluto": swe.PLUTO,
     "chiron": swe.CHIRON, "true_node": swe.TRUE_NODE,
-    "lilith": swe.OSCU_APOG   # Lilith (osculating apogee = „True Lilith“)
+    "lilith": swe.OSCU_APOG  # True Lilith
 }
 
 SIGNS = [
@@ -38,6 +38,7 @@ def astro():
         lat = float(data["latitude"])
         lon = float(data["longitude"])
 
+        # robustes Timestamp-Parsing (Unix oder ISO, mit/ohne Z)
         def parse_ts(ts_val):
             if ts_val is None:
                 raise ValueError("timestamp_utc fehlt")
@@ -56,13 +57,20 @@ def astro():
         dt = parse_ts(ts)
         jd = swe.julday(dt.year, dt.month, dt.day, dt.hour + dt.minute/60 + dt.second/3600)
 
+        # Flags: Swiss Ephemeris + Geschwindigkeiten
         flags = swe.FLG_SWIEPH | swe.FLG_SPEED
-        ascmc, cusps = swe.houses_ex(jd, lat, lon, b"P")
+
+        # WICHTIG: houses_ex liefert (cusps, ascmc)
+        cusps, ascmc = swe.houses_ex(jd, lat, lon, b"P")
         asc, mc = ascmc[0], ascmc[1]
 
+        # Cusps korrekt auf 12 Werte (Index 1..12)
+        cusps12 = [round(float(cusps[i]), 3) for i in range(1, 13)]
+
+        # Planeten berechnen
         planets = {}
         for name, pid in PLANETS.items():
-            res = swe.calc_ut(jd, pid, flags)
+            res = swe.calc_ut(jd, pid, flags)  # [lon, lat, dist, speed_lon, ...]
             plon, plat, pspeed = res[0], res[1], res[3]
             planets[name] = {
                 "lon": round(plon, 3),
@@ -75,9 +83,10 @@ def astro():
             "datetime_utc": dt.replace(tzinfo=pytz.UTC).isoformat(),
             "planets": planets,
             "houses": {
+                "system": "placidus",
                 "asc": round(asc, 3),
                 "mc": round(mc, 3),
-                "cusps": [round(float(x), 3) for x in cusps]
+                "cusps": cusps12
             }
         }), 200
 
@@ -87,4 +96,3 @@ def astro():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
-
