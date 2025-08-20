@@ -15,7 +15,7 @@ def health():
 def version():
     return jsonify({
         "service": "MoSe.ai_astro_server",
-        "marker": "v-cusps-len-fix-01",
+        "marker": "v-planet-shape-fix-01",
         "swisseph": getattr(swe, "__version__", "unknown"),
         "status": "live"
     }), 200
@@ -27,16 +27,20 @@ SIGNS = [
     "Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces"
 ]
 
-# True Node & True Lilith (osculating apogee)
+# True Node & True Lilith (osculating apogee).
+# Hinweis: CHIRON benötigt SE-Datafiles; ohne diese liefern wir eine Warnung/Fehlerobjekt.
 PLANETS = {
     "sun": swe.SUN, "moon": swe.MOON, "mercury": swe.MERCURY, "venus": swe.VENUS,
     "mars": swe.MARS, "jupiter": swe.JUPITER, "saturn": swe.SATURN,
     "uranus": swe.URANUS, "neptune": swe.NEPTUNE, "pluto": swe.PLUTO,
-    "chiron": swe.CHIRON, "true_node": swe.TRUE_NODE,
-    "lilith": swe.OSCU_APOG
+    "true_node": swe.TRUE_NODE,
+    "lilith": swe.OSCU_APOG,
+    "chiron": swe.CHIRON
 }
 
-EPH_FLAGS = swe.FLG_SWIEPH | swe.FLG_SPEED
+# Flags: **Moshier** + SPEED → keine SE-Datafiles nötig (Planeten/Node/Lilith laufen).
+EPH_FLAGS = swe.FLG_MOSEPH | swe.FLG_SPEED
+
 ALLOWED_HOUSES = {"P","K","E","W","R","C","B","H","M","T","O"}
 
 
@@ -49,7 +53,6 @@ def sign_from_lon(lon: float) -> str:
     return SIGNS[int(normalize_deg(lon) // 30) % 12]
 
 def parse_ts(ts_val):
-    """Akzeptiert Unix (int/float/Ziffern-String) oder ISO (mit/ohne Z/Whitespace)."""
     if ts_val is None:
         raise ValueError("timestamp_utc fehlt")
     if isinstance(ts_val, (int, float)):
@@ -77,20 +80,21 @@ def validate_lat_lon(lat, lon):
 
 def pick_housesys(val):
     if not val:
-        return b"P"  # Default: Placidus
+        return b"P"
     code = str(val).strip().upper()
     if code not in ALLOWED_HOUSES:
         raise ValueError(f"houses_system '{code}' wird nicht unterstützt")
     return code.encode("ascii")
 
 def read_input():
-    """Nimmt Request-Daten an (JSON, Raw-JSON, Form, Query)."""
+    # JSON (auch ohne Header)
     try:
         data = request.get_json(force=True, silent=True)
         if isinstance(data, dict):
             return data
     except Exception:
         pass
+    # Raw-Body als JSON
     try:
         raw = request.get_data(as_text=True)
         if raw:
@@ -99,17 +103,16 @@ def read_input():
                 return data
     except Exception:
         pass
+    # Form
     if request.form:
         return {k: request.form.get(k) for k in request.form.keys()}
+    # Query
     if request.args:
         return {k: request.args.get(k) for k in request.args.keys()}
     raise ValueError("Request hat keinen lesbaren Body/Parameter (erwarte JSON mit timestamp_utc, latitude, longitude)")
 
 def cusps_to_12(cusps):
-    """Akzeptiert beide Varianten:
-       - Länge 13 → Index 1..12
-       - Länge 12 → Index 0..11
-    """
+    # Akzeptiere beide Varianten (12 oder 13 Elemente)
     if not isinstance(cusps, (list, tuple)):
         raise ValueError("houses_ex lieferte keine Cusp-Liste")
     n = len(cusps)
@@ -119,9 +122,29 @@ def cusps_to_12(cusps):
         return [round(float(cusps[i]), 3) for i in range(0, 12)]
     raise ValueError(f"houses_ex lieferte unerwartete cusps-Länge: {n}")
 
+def extract_lon_lat_speed(res):
+    """
+    Macht beide Formen robust:
+    a) [lon, lat, dist, speed_lon, ...]
+    b) ([lon, lat, dist], [speed_lon, speed_lat, speed_dist])
+    """
+    if not isinstance(res, (list, tuple)) or len(res) == 0:
+        raise ValueError("calc_ut Ergebnis leer/ungültig")
+    first = res[0]
+    # b) zwei-Tupel-Form
+    if isinstance(first, (list, tuple)):
+        lon = float(first[0])
+        lat = float(first[1]) if len(first) > 1 else 0.0
+        spd = float(res[1][0]) if len(res) > 1 and isinstance(res[1], (list, tuple)) and len(res[1]) > 0 else 0.0
+        return lon, lat, spd
+    # a) flache Form
+    lon = float(res[0])
+    lat = float(res[1]) if len(res) > 1 else 0.0
+    spd = float(res[3]) if len(res) > 3 else 0.0
+    return lon, lat, spd
+
 
 # -------- API --------
-# GET erlaubt, damit du im Browser testen kannst.
 @app.route("/astro", methods=["POST", "GET"])
 def astro():
     try:
@@ -132,7 +155,7 @@ def astro():
         ts = data.get("timestamp_utc")
         lat = data.get("latitude")
         lon = data.get("longitude")
-        hs_in = data.get("houses_system")  # optional: "P","W",...
+        hs_in = data.get("houses_system")
 
         if lat is None or lon is None:
             raise ValueError("latitude und longitude sind erforderlich")
@@ -140,14 +163,13 @@ def astro():
         lat, lon = validate_lat_lon(lat, lon)
         hs_code = pick_housesys(hs_in)
 
-        # Zeitpunkt -> Julian Day
         dt = parse_ts(ts)
         jd = swe.julday(dt.year, dt.month, dt.day,
                         dt.hour + dt.minute/60 + dt.second/3600)
 
         warnings = []
 
-        # Häuser mit Fallback (bei Problemen auf Whole Sign)
+        # Häuser (mit Fallback auf Whole Sign)
         try:
             cusps, ascmc = swe.houses_ex(jd, lat, lon, hs_code)
         except Exception:
@@ -155,32 +177,35 @@ def astro():
             warnings.append("houses_system_fallback_to_W")
             hs_code = b"W"
 
+        # ascmc hat mind. 2 Werte (ASC, MC); viele Varianten liefern 8.
         if not isinstance(ascmc, (list, tuple)) or len(ascmc) < 2:
-            raise ValueError(f"houses_ex lieferte unerwartete ascmc-Länge: {len(ascmc) if isinstance(ascmc,(list,tuple)) else 'kein Array'}")
+            raise ValueError(f"houses_ex ascmc-Länge unerwartet: {len(ascmc) if isinstance(ascmc,(list,tuple)) else 'kein Array'}")
 
         asc = normalize_deg(ascmc[0])
         mc  = normalize_deg(ascmc[1])
         cusps12 = cusps_to_12(cusps)
 
-        # Planeten robust
+        # Planeten
         planets = {}
-        planet_result_lengths = {}
+        planet_result_shapes = {}
         for name, pid in PLANETS.items():
             try:
                 res = swe.calc_ut(jd, pid, EPH_FLAGS)
-                if not isinstance(res, (list, tuple)) or len(res) < 1:
-                    planets[name] = {"error": "calc_ut Ergebnis leer/ungültig"}
-                    planet_result_lengths[name] = None
-                    warnings.append(f"{name}_calc_failed")
-                    continue
-                planet_result_lengths[name] = len(res)
-                plon = normalize_deg(res[0])
-                plat = float(res[1]) if len(res) > 1 else 0.0
-                pspeed = float(res[3]) if len(res) > 3 else 0.0
+                # shape protokollieren
+                if isinstance(res, (list, tuple)):
+                    if len(res) >= 1 and isinstance(res[0], (list, tuple)):
+                        planet_result_shapes[name] = "tuple_of_tuples"
+                    else:
+                        planet_result_shapes[name] = f"flat_len_{len(res)}"
+                else:
+                    planet_result_shapes[name] = "unknown"
+
+                lon_v, lat_v, spd_v = extract_lon_lat_speed(res)
+                plon = normalize_deg(lon_v)
                 planets[name] = {
                     "lon": round(plon, 3),
-                    "lat": round(plat, 3),
-                    "speed": round(pspeed, 3),
+                    "lat": round(float(lat_v), 3),
+                    "speed": round(float(spd_v), 3),
                     "sign": sign_from_lon(plon)
                 }
             except Exception as ex:
@@ -201,8 +226,7 @@ def astro():
                 "jd": jd,
                 "ascmc_len": len(ascmc),
                 "cusps_len": len(cusps),
-                "ascmc_raw": [float(x) for x in ascmc],
-                "planet_result_lengths": planet_result_lengths
+                "planet_result_shapes": planet_result_shapes
             }
 
         return jsonify(out), 200
