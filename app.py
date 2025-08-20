@@ -10,11 +10,11 @@ from datetime import datetime, timedelta
 # ------------------------------------------------------------------------------
 app = Flask(__name__)
 
-# Deine Swiss Ephemeris Dateien liegen im Repo unter /ephe (z.B. seas_18.se1)
-try:
-    swe.set_ephe_path("ephe")
-except Exception:
-    pass
+# Deine Swiss Ephemeris Dateien: /ephe (z. B. seas_18.se1)
+import os
+EPHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ephe")
+swe.set_ephe_path(EPHE_DIR)
+
 
 @app.route("/", methods=["GET"])
 def health():
@@ -369,3 +369,4 @@ def astro():
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
