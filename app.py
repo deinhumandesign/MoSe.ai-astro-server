@@ -56,7 +56,7 @@ def astro():
         dt = parse_ts(ts)
         jd = swe.julday(dt.year, dt.month, dt.day, dt.hour + dt.minute/60 + dt.second/3600)
 
-        flags = swe.FLAG_SPEED
+        flags = swe.FLG_SWIEPH | swe.FLG_SPEED
         ascmc, cusps = swe.houses_ex(jd, lat, lon, b"P")
         asc, mc = ascmc[0], ascmc[1]
 
@@ -87,3 +87,4 @@ def astro():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
