@@ -15,7 +15,7 @@ def health():
 def version():
     return jsonify({
         "service": "MoSe.ai_astro_server",
-        "marker": "v-accept-any-body-02",  # Marker um frische Deploys zu erkennen
+        "marker": "v-cusps-len-fix-01",
         "swisseph": getattr(swe, "__version__", "unknown"),
         "status": "live"
     }), 200
@@ -49,8 +49,7 @@ def sign_from_lon(lon: float) -> str:
     return SIGNS[int(normalize_deg(lon) // 30) % 12]
 
 def parse_ts(ts_val):
-    """Akzeptiert Unix (int/float/Ziffern-String) oder ISO (mit/ohne Z/Whitespace).
-    Gibt naive UTC-datetime zurück (ohne tzinfo)."""
+    """Akzeptiert Unix (int/float/Ziffern-String) oder ISO (mit/ohne Z/Whitespace)."""
     if ts_val is None:
         raise ValueError("timestamp_utc fehlt")
     if isinstance(ts_val, (int, float)):
@@ -85,23 +84,13 @@ def pick_housesys(val):
     return code.encode("ascii")
 
 def read_input():
-    """
-    Nimmt den Request an – egal wie er kommt:
-    - korrektes JSON (mit/ohne Content-Type)
-    - Raw-Text JSON
-    - Form-Data/URL-encoded
-    - Query-Parameter (GET oder POST)
-    Gibt immer ein dict zurück oder wirft einen klaren Fehler.
-    """
-    # 1) JSON (auch wenn Header fehlt/falsch ist)
+    """Nimmt Request-Daten an (JSON, Raw-JSON, Form, Query)."""
     try:
         data = request.get_json(force=True, silent=True)
         if isinstance(data, dict):
             return data
     except Exception:
         pass
-
-    # 2) Raw-Body als JSON
     try:
         raw = request.get_data(as_text=True)
         if raw:
@@ -110,20 +99,29 @@ def read_input():
                 return data
     except Exception:
         pass
-
-    # 3) Form-Daten
     if request.form:
         return {k: request.form.get(k) for k in request.form.keys()}
-
-    # 4) Query-String
     if request.args:
         return {k: request.args.get(k) for k in request.args.keys()}
-
     raise ValueError("Request hat keinen lesbaren Body/Parameter (erwarte JSON mit timestamp_utc, latitude, longitude)")
+
+def cusps_to_12(cusps):
+    """Akzeptiert beide Varianten:
+       - Länge 13 → Index 1..12
+       - Länge 12 → Index 0..11
+    """
+    if not isinstance(cusps, (list, tuple)):
+        raise ValueError("houses_ex lieferte keine Cusp-Liste")
+    n = len(cusps)
+    if n >= 13:
+        return [round(float(cusps[i]), 3) for i in range(1, 13)]
+    if n == 12:
+        return [round(float(cusps[i]), 3) for i in range(0, 12)]
+    raise ValueError(f"houses_ex lieferte unerwartete cusps-Länge: {n}")
 
 
 # -------- API --------
-# WICHTIG: Akzeptiere POST **und GET**, damit du im Browser testen kannst.
+# GET erlaubt, damit du im Browser testen kannst.
 @app.route("/astro", methods=["POST", "GET"])
 def astro():
     try:
@@ -147,8 +145,9 @@ def astro():
         jd = swe.julday(dt.year, dt.month, dt.day,
                         dt.hour + dt.minute/60 + dt.second/3600)
 
-        # Häuser (mit Fallback, z. B. bei sehr hohen Breiten)
         warnings = []
+
+        # Häuser mit Fallback (bei Problemen auf Whole Sign)
         try:
             cusps, ascmc = swe.houses_ex(jd, lat, lon, hs_code)
         except Exception:
@@ -156,16 +155,14 @@ def astro():
             warnings.append("houses_system_fallback_to_W")
             hs_code = b"W"
 
-        if not isinstance(cusps, (list, tuple)) or len(cusps) < 13:
-            raise ValueError(f"houses_ex lieferte unerwartete cusps-Länge: {len(cusps) if isinstance(cusps,(list,tuple)) else 'kein Array'}")
         if not isinstance(ascmc, (list, tuple)) or len(ascmc) < 2:
             raise ValueError(f"houses_ex lieferte unerwartete ascmc-Länge: {len(ascmc) if isinstance(ascmc,(list,tuple)) else 'kein Array'}")
 
         asc = normalize_deg(ascmc[0])
         mc  = normalize_deg(ascmc[1])
-        cusps12 = [round(float(cusps[i]), 3) for i in range(1, 13)]
+        cusps12 = cusps_to_12(cusps)
 
-        # Planeten robust (falls speed nicht geliefert wird)
+        # Planeten robust
         planets = {}
         planet_result_lengths = {}
         for name, pid in PLANETS.items():
