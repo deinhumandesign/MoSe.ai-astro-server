@@ -5,21 +5,16 @@ from pytz.exceptions import AmbiguousTimeError, NonExistentTimeError
 from datetime import datetime, timedelta
 
 # ------------------------------------------------------------------------------
-# Ephemeriden-Pfad ROBUST setzen (VOR Import) + Fallbacks
+# Ephemeriden-Pfad robust setzen (VOR Import) + Fallbacks
 # ------------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EPHE_DIR = os.path.join(BASE_DIR, "ephe")
-# Für die C-Bibliothek (muss vor Import gesetzt sein)
-os.environ["SE_EPHE_PATH"] = EPHE_DIR
+os.environ["SE_EPHE_PATH"] = EPHE_DIR  # für die C-Lib
 
 import swisseph as swe  # erst jetzt importieren!
 
-# zusätzlich mehrere Kandidaten-Pfade setzen (wie in deiner funktionierenden Version)
 CANDIDATE_DIRS = [
-    EPHE_DIR,                   # ./ephe (absolut)
-    BASE_DIR,                   # Projektdir
-    "/usr/share/swisseph",      # Systempfade
-    "/usr/local/share/swisseph"
+    EPHE_DIR, BASE_DIR, "/usr/share/swisseph", "/usr/local/share/swisseph"
 ]
 swe.set_ephe_path(":".join([p for p in CANDIDATE_DIRS if os.path.isdir(p)]))
 
@@ -48,7 +43,7 @@ def health():
 def version():
     return jsonify({
         "service": "MoSe.ai_astro_server",
-        "marker": "v-ephe-robust-merge-01",
+        "marker": "v-design-88deg-exact-01",
         "swisseph": getattr(swe, "__version__", "unknown"),
         "status": "live",
         "ephe": _ephe_info()
@@ -119,6 +114,8 @@ def read_input():
 # ------------------------------------------------------------------------------
 # Zeit-Parsing
 # ------------------------------------------------------------------------------
+from datetime import datetime, timedelta
+
 def parse_ts_from_inputs(data: dict):
     ts = data.get("timestamp_utc")
     if ts is not None:
@@ -215,6 +212,53 @@ def house_of(lon_deg, cusps12):
             return i+1
     return 12
 
+def calc_houses(jd, lat, lon, hs_code):
+    cusps, ascmc = swe.houses_ex(jd, lat, lon, hs_code)
+    if not isinstance(ascmc, (list, tuple)) or len(ascmc) < 2:
+        raise ValueError("houses_ex ascmc-Länge unerwartet")
+    asc = normalize_deg(ascmc[0]); mc = normalize_deg(ascmc[1])
+    cusps12 = cusps_to_12(cusps)
+    houses = {"asc": round(asc, 3), "mc": round(mc, 3), "cusps": cusps12}
+    for i, val in enumerate(cusps12, start=1):
+        houses[f"c{i}"] = val
+    return houses, cusps12
+
+# ----- Hilfen: Sonne & exakter 88°-Zeitpunkt (Newton) ------------------------
+def angle_diff_signed(a_deg, b_deg):
+    """liefert (a-b) als kleinsten signierten Winkel in (-180..+180]"""
+    d = (a_deg - b_deg) % 360.0
+    if d > 180.0: d -= 360.0
+    return d
+
+def julday_from_dt(dt: datetime) -> float:
+    return swe.julday(dt.year, dt.month, dt.day, dt.hour + dt.minute/60 + dt.second/3600.0)
+
+def sun_lon_and_speed(dt: datetime):
+    jd = julday_from_dt(dt)
+    res = swe.calc_ut(jd, swe.SUN, FLAGS_MOSEPH)
+    lon, lat, spd = extract_lon_lat_speed(res)
+    return normalize_deg(lon), float(spd)  # spd ~ deg/day
+
+def find_design_datetime_exact(dt_birth_utc: datetime) -> datetime:
+    """Finde t, so dass λ☉(t) = λ☉(birth) - 88° (exakt, tropisch)."""
+    lon_birth, _ = sun_lon_and_speed(dt_birth_utc)
+    target = normalize_deg(lon_birth - 88.0)
+
+    # Start mit ~88 Tagen zurück
+    t = dt_birth_utc - timedelta(days=88.0)
+
+    # Newton-Iteration (max 10 Schritte)
+    for _ in range(10):
+        lon_t, spd = sun_lon_and_speed(t)
+        err = angle_diff_signed(lon_t, target)  # deg
+        if abs(err) < 1e-4:  # ~0.0001° = 0.36"
+            break
+        if abs(spd) < 1e-6:
+            break
+        # Korrektur in Tagen
+        t = t - timedelta(days=(err / spd))
+    return t
+
 def calc_planets(jd, lat, lon, cusps12):
     planets = {}
     for name, pid in PLANETS.items():
@@ -250,17 +294,6 @@ def calc_planets(jd, lat, lon, cusps12):
         }
     return planets
 
-def calc_houses(jd, lat, lon, hs_code):
-    cusps, ascmc = swe.houses_ex(jd, lat, lon, hs_code)
-    if not isinstance(ascmc, (list, tuple)) or len(ascmc) < 2:
-        raise ValueError("houses_ex ascmc-Länge unerwartet")
-    asc = normalize_deg(ascmc[0]); mc = normalize_deg(ascmc[1])
-    cusps12 = cusps_to_12(cusps)
-    houses = {"asc": round(asc, 3), "mc": round(mc, 3), "cusps": cusps12}
-    for i, val in enumerate(cusps12, start=1):
-        houses[f"c{i}"] = val
-    return houses, cusps12
-
 # ------------------------------------------------------------------------------
 # API
 # ------------------------------------------------------------------------------
@@ -280,12 +313,12 @@ def astro():
         dt_utc, modeinfo = parse_ts_from_inputs(data)
         jd = swe.julday(dt_utc.year, dt_utc.month, dt_utc.day,
                         dt_utc.hour + dt_utc.minute/60 + dt_utc.second/3600)
+
         houses_birth, cusps_birth = calc_houses(jd, lat, lon, hs_code)
         planets_birth = calc_planets(jd, lat, lon, cusps_birth)
 
-        # Design (~88° Solarbogen zurück)  -> ~ (88 * 365.2422 / 360) Tage
-        days_back = 88.0 * 365.2422 / 360.0
-        dt_design = dt_utc - timedelta(days=days_back)
+        # Design: EXAKT 88° Sonnenabstand (statt fester Tage)
+        dt_design = find_design_datetime_exact(dt_utc)
         jd_d = swe.julday(dt_design.year, dt_design.month, dt_design.day,
                           dt_design.hour + dt_design.minute/60 + dt_design.second/3600)
         houses_design, cusps_design = calc_houses(jd_d, lat, lon, hs_code)
